@@ -1,29 +1,41 @@
 #![no_std]
 #![no_main]
 
+/**
+ * Rust program for Longan Nano microcontroller board and DHT77
+ * temperature and humidity sensor. Reads the data from the sensor
+ * prints the values to the Longan Nano's LCD screen.
+ * 
+ * Authors: Teemu Miettunen, teemu.miettunen@tuni.fi
+ *          Elias Hagelberg, elias.hagelberg@tuni.fi
+ */
+
 use heapless::String;
-
-use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Rectangle, PrimitiveStyle};
-use embedded_graphics::text::Text;
-use embedded_graphics::mono_font::{MonoTextStyleBuilder, iso_8859_1::FONT_10X20};
-
+use embedded_graphics::{
+    pixelcolor::Rgb565,
+    prelude::*,
+    primitives::{Rectangle, PrimitiveStyle},
+    text::Text,
+    mono_font::{MonoTextStyleBuilder, iso_8859_1::FONT_10X20}
+};
 use embedded_hal::digital::v2::{OutputPin, InputPin};
-
-use longan_nano::hal::{pac, rcu::RcuExt, prelude::*};
-use longan_nano::hal::delay::{McycleDelay};
-
-use longan_nano::hal::gpio::{Floating, Input};
-use longan_nano::hal::gpio::gpioa::PA0;
-
+use longan_nano::hal::{
+    {pac, rcu::RcuExt, prelude::*},
+    delay::{McycleDelay},
+    {eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType}},
+    timer::{Event, Timer},
+    gpio::{Floating, Input},
+    gpio::gpioa::PA0
+};
 use longan_nano::{lcd, lcd_pins};
-
 use riscv_rt::entry;
 use panic_halt as _;
 
+//Global variables for data and timer 
+static mut DATA:(f32, f32) = (0.0, 0.0);
+static mut TIMER: Option<Timer<longan_nano::hal::pac::TIMER1>> = None;
 
-
+//Function for reading data from the sensor
 fn read_data(signal_pin: PA0<Input<Floating>>, mut delay: McycleDelay) -> (f32, f32) {
 
     // same as count_ in c library
@@ -112,6 +124,19 @@ fn read_data(signal_pin: PA0<Input<Floating>>, mut delay: McycleDelay) -> (f32, 
     
 }
 
+//Interrupt handler function
+fn TIMER1(){
+
+    unsafe{
+        riscv::interrupt::free(|_|{
+            //tämä ei vielä toimi
+            DATA = read_data(signal_pin, delay);
+
+            TIMER.as_mut().unwrap().clear_update_interrupt_flag();
+        });
+    }
+}
+
 #[entry]
 fn main() -> ! {
     let dp = pac::Peripherals::take().unwrap();
@@ -135,6 +160,26 @@ fn main() -> ! {
     let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
     let (width, height) = (lcd.size().width as i32, lcd.size().height as i32);
 
+
+    //Set timer
+    unsafe{
+        let mut timer = Timer::timer1(dp.TIMER1, 1.hz(), &mut rcu);
+        timer.listen(Event::Update);
+        TIMER = Some(timer);
+    }
+
+    //ECLIC setup
+    pac::ECLIC::reset();
+    pac::ECLIC::set_level_priority_bits(LevelPriorityBits::L0P4);
+    pac::ECLIC::set_threshold_level(Level::L1);
+    pac::ECLIC::setup(pac::Interrupt::TIMER1, TriggerType::Level, Level::L1, Priority::P1);
+    unsafe{
+        pac::ECLIC::unmask(pac::Interrupt::TIMER1)
+    };
+
+    //Enable interrupts
+    unsafe{riscv::interrupt::enable()};
+
     // Clear screen
     Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
@@ -148,30 +193,36 @@ fn main() -> ! {
         .build();
 
     // (temperature, humidity) pair
-    let data = read_data(signal_pin, delay);
-
-    let mut t_as_text: String<10> = String::from(data.0 as i32);
-
-    t_as_text.push('°').unwrap();
-    t_as_text.push('C').unwrap();
+    //let data = read_data(signal_pin, delay);
 
 
-    // Draw temperature
-    Text::new(t_as_text.as_str(), Point::new(40, 35), style)
-        .draw(&mut lcd)
-        .unwrap();
+    loop {
+        unsafe{
+            //set text from counter
+            let mut t_as_text: String<10> = String::from(DATA.0 as i32);
+
+            t_as_text.push('°').unwrap();
+            t_as_text.push('C').unwrap();
+
+
+            // Draw temperature
+            Text::new(t_as_text.as_str(), Point::new(40, 35), style)
+                .draw(&mut lcd)
+                .unwrap();
+            
+            let mut h_as_text: String<10> = String::from(DATA.1 as i32);
+
+            h_as_text.push('%').unwrap();
+            
+            // Draw humidity
+            Text::new(h_as_text.as_str(), Point::new(40, 60), style)
+                .draw(&mut lcd)
+                .unwrap();
+            }
     
-    let mut h_as_text: String<10> = String::from(data.1 as i32);
-
-    h_as_text.push('%').unwrap();
-    
-    // Draw humidity
-    Text::new(h_as_text.as_str(), Point::new(40, 60), style)
-        .draw(&mut lcd)
-        .unwrap();
-
-
-    loop {}
+        //set chip to sleep
+        unsafe{riscv::asm::wfi();}
+    }
 }
 
 
