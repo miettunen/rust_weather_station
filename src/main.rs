@@ -35,8 +35,11 @@ use panic_halt as _;
 static mut DATA:(f32, f32) = (0.0, 0.0);
 static mut TIMER: Option<Timer<longan_nano::hal::pac::TIMER1>> = None;
 
+static mut DELAY: Option<McycleDelay> = None;
+static mut SIGNAL_PIN: Option<PA0<Input<Floating>>> = None;
+
 //Function for reading data from the sensor
-fn read_data(signal_pin: PA0<Input<Floating>>, mut delay: McycleDelay) -> (f32, f32) {
+fn read_data(signal_pin: PA0<Input<Floating>>, mut delay: McycleDelay) -> Result<(f32, f32), &'static str> {
 
     // same as count_ in c library
     let count_ = 22;
@@ -97,12 +100,14 @@ fn read_data(signal_pin: PA0<Input<Floating>>, mut delay: McycleDelay) -> (f32, 
         
         // temperature
         let mut t = data[2] as f32;
-        if data[3]%128<10{
-            t += (data[3]%128/10) as f32;
-        } else if data[3]%128<100{
-            t += (data[3]%128/100) as f32;
-        } else{
-            t += ((data[3]%128) as i32 /1000) as f32;
+
+        let value = data[3]%128;
+        match value {
+            0..=9 => t += (data[3]%128/10) as f32,
+
+            10..=100 => t += (data[3]%128/100) as f32,
+
+            _ => t += ((data[3]%128) as i32 /1000) as f32,
         }
 
         // The left-most digit indicate the negative sign. 
@@ -113,15 +118,12 @@ fn read_data(signal_pin: PA0<Input<Floating>>, mut delay: McycleDelay) -> (f32, 
         // Humidity
         let h = data[0] as f32;
 
-        return (t, h);
-
+        //Return temp and humidity values
+        return Ok((t, h));
 
     }
     // return this when something failed
-    return (1111.0, 1111.0);
-
-    
-    
+    return Err("Could not read values!"); 
 }
 
 //Interrupt handler function
@@ -129,8 +131,16 @@ fn TIMER1(){
 
     unsafe{
         riscv::interrupt::free(|_|{
-            //tämä ei vielä toimi
-            DATA = read_data(signal_pin, delay);
+
+            //tämä ei vielä toimi  
+            let signal_pin = SIGNAL_PIN.unwrap();
+            let delay = DELAY.unwrap();
+            
+            let data= read_data(signal_pin, delay);
+            match data {
+                Ok(v) => DATA = v,
+                Err(_e) => DATA = (1111.0, 1111.0),
+            }
 
             TIMER.as_mut().unwrap().clear_update_interrupt_flag();
         });
@@ -153,13 +163,17 @@ fn main() -> ! {
     let gpioa = dp.GPIOA.split(&mut rcu);
     let gpiob = dp.GPIOB.split(&mut rcu);
 
-    let signal_pin = gpioa.pa0;
+    let signal_pin  = gpioa.pa0;
     let delay = McycleDelay::new(&rcu.clocks);
+
+    unsafe{
+        SIGNAL_PIN = Some(signal_pin);
+        DELAY = Some(delay);
+    }
 
     let lcd_pins = lcd_pins!(gpioa, gpiob);
     let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
     let (width, height) = (lcd.size().width as i32, lcd.size().height as i32);
-
 
     //Set timer
     unsafe{
@@ -195,7 +209,6 @@ fn main() -> ! {
     // (temperature, humidity) pair
     //let data = read_data(signal_pin, delay);
 
-
     loop {
         unsafe{
             //set text from counter
@@ -203,7 +216,6 @@ fn main() -> ! {
 
             t_as_text.push('°').unwrap();
             t_as_text.push('C').unwrap();
-
 
             // Draw temperature
             Text::new(t_as_text.as_str(), Point::new(40, 35), style)
