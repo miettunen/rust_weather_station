@@ -5,190 +5,190 @@
  * Rust program for Longan Nano microcontroller board and DHT77
  * temperature and humidity sensor. Reads the data from the sensor
  * prints the values to the Longan Nano's LCD screen.
- * 
+ *
+ * read_data-function inspired by Seedstudio's C++ library:
+ * https://github.com/Seeed-Studio/Grove_Temperature_And_Humidity_Sensor
+ *
+ *
  * Authors: Teemu Miettunen, teemu.miettunen@tuni.fi
  *          Elias Hagelberg, elias.hagelberg@tuni.fi
  */
-use heapless::String;
-use embedded_graphics::{
-    pixelcolor::Rgb565,
-    prelude::*,
-    primitives::{Rectangle, PrimitiveStyle},
-    text::Text,
-    mono_font::{MonoTextStyleBuilder, iso_8859_1::FONT_10X20}
-};
-use embedded_hal::digital::v2::{OutputPin, InputPin};
-use longan_nano::hal::{
-    {pac, rcu::RcuExt, prelude::*},
-    delay::{McycleDelay},
-    {eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType}},
-    timer::{Event, Timer},
-    gpio::{Floating, Input, Output, PushPull, PullUp},
-    gpio::gpioa::{PA0,PA3}
-};
-use longan_nano::{lcd, lcd_pins};
-use riscv_rt::entry;
-use panic_halt as _;
-use riscv::interrupt::{Mutex, free};
+
 use core::cell::RefCell;
 use core::ops::DerefMut;
+use embedded_graphics::{
+    mono_font::{iso_8859_1::FONT_10X20, MonoTextStyleBuilder},
+    pixelcolor::Rgb565,
+    prelude::*,
+    primitives::{PrimitiveStyle, Rectangle},
+    text::Text,
+};
+use embedded_hal::digital::v2::{InputPin, OutputPin};
+use heapless::String;
+use longan_nano::hal::{
+    delay::McycleDelay,
+    eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType},
+    gpio::gpioa::PA0,
+    gpio::{Output, PushPull},
+    timer::{Event, Timer},
+    {pac, prelude::*, rcu::RcuExt},
+};
+use longan_nano::{lcd, lcd_pins};
+use panic_halt as _;
+use riscv::interrupt::{free, Mutex};
+use riscv_rt::entry;
 
-//Global variables for data and timer 
-//static mut DATA:(f32, f32) = (0.0, 0.0);
-//static mut TIMER: Option<Timer<longan_nano::hal::pac::TIMER1>> = None;
+// Interrupt timer
+static TIMER: Mutex<RefCell<Option<Timer<longan_nano::hal::pac::TIMER1>>>> =
+    Mutex::new(RefCell::new(None));
 
-//static mut DELAY: Option<McycleDelay> = None;
-//static mut SIGNAL_PIN: Option<PA0<Input<Floating>>> = None;
-
-static TIMER: Mutex<RefCell<Option<Timer<longan_nano::hal::pac::TIMER1>>>> = Mutex::new(RefCell::new(None));
+// Measured (temperature, humidity) pair
 static DATA: Mutex<RefCell<Option<(f32, f32)>>> = Mutex::new(RefCell::new(Some((0.0, 0.0))));
+
+// Used for creating delays in read_data-function
 static DELAY: Mutex<RefCell<Option<McycleDelay>>> = Mutex::new(RefCell::new(None));
-static IN_PIN: Mutex<RefCell<Option<PA0<Input<PullUp>>>>> = Mutex::new(RefCell::new(None));
-static OUT_PIN: Mutex<RefCell<Option<PA3<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
-static mut TIMER_COUNTER:u32  = 0;
+
+// Pin used for reading data from sensor
+static SIGNAL_PIN: Mutex<RefCell<Option<PA0<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
+
+// Counter to only read data on specific interrupts to decrease update inverval from 1 Hz
+static mut TIMER_COUNTER: u32 = 0;
 
 // Update interval in seconds
 static UPDATE_INTERVAL: u32 = 3;
 
-
-
 //Function for reading data from the sensor
 fn read_data() -> Result<(f32, f32), &'static str> {
-    let mut in_pin_saved = None;
+    // Used for saving and replacing signal pin after taking it from SIGNAL_PIN
+    let mut signal_pin_saved = None;
+
+    // Keeps track of signal pin needing to be replaced in SIGNAL_PIN
     let mut replaced = false;
-    let mut t  = 1001.0;
+
+    // Initialize variables for temperature and humidity
+    let mut t = 1001.0;
     let mut h = 1001.0;
+
     free(|cs| {
-        if let Some(ref mut in_pinn)= IN_PIN.borrow(*cs).borrow_mut().deref_mut() {
-            if let Some(mut out_pin) = OUT_PIN.borrow(*cs).take() {
-                if let Some(ref mut delay) = DELAY.borrow(*cs).borrow_mut().deref_mut() {
+        if let Some(mut signal_pin) = SIGNAL_PIN.borrow(*cs).take() {
+            if let Some(ref mut delay) = DELAY.borrow(*cs).borrow_mut().deref_mut() {
+                replaced = true;
 
-                    replaced = true;
+                // same as count_ in c++ library, based on cpu clock speed which in this project is 80 MHz
+                let count_ = 22;
 
-                    // same as count_ in c library
-                    let count_ = 22;
+                // how many timing transitions are needed to keep track of. 2 * number bits + extra
+                let maxtimings_ = 85;
 
-                    // same as MAXTIMINGS in c library
-                    let maxtimings_ = 85;
+                let mut laststate: bool = true;
+                let mut counter: i32;
+                let mut i: u8 = 0;
+                let mut j: u8 = 0;
 
-                    let mut laststate: bool = true;
-                    let mut counter: i32;
-                    let mut  i: u8 = 0;
-                    let mut j: u8 = 0;
+                // Storing read data, first byte for humidity, 3rd and 4th for temperature
+                let mut data: [u8; 5] = [0, 0, 0, 0, 0];
 
-                    let mut data: [u8; 5] = [0, 0, 0, 0, 0];
+                signal_pin.set_high().unwrap();
+                delay.delay_ms(250);
 
+                signal_pin.set_low().unwrap();
+                delay.delay_ms(20);
 
-                    out_pin.set_high().unwrap();
-                    delay.delay_ms(250);
+                signal_pin.set_high().unwrap();
+                delay.delay_us(40);
 
-                    out_pin.set_low().unwrap();
-                    delay.delay_ms(20);
+                let signal_pin_input = signal_pin.into_pull_up_input();
 
-                    out_pin.set_high().unwrap();
-                    delay.delay_us(40);
-
-                    let in_pin = out_pin.into_pull_up_input();
-                    
-
-
-                    // read in timings
-                    while i < maxtimings_{
-                        counter = 0;
-                        while in_pin.is_high().unwrap() == laststate {
-                            counter += 1;
-                            delay.delay_us(1);
-                            if counter == 255 {
-                                break;
-                            }
-                        }
-                        laststate = in_pin.is_high().unwrap();
-
+                // read in timings
+                while i < maxtimings_ {
+                    counter = 0;
+                    while signal_pin_input.is_high().unwrap() == laststate {
+                        counter += 1;
+                        delay.delay_us(1);
                         if counter == 255 {
                             break;
                         }
-                        
-
-                        // ignore first 3 transitions
-                        if (i >= 4) && (i % 2 == 0) {
-                            // shove each bit into the storage bytes
-                            let index = (j / 8) as usize;
-                            data[index] <<= 1;
-                            if counter > count_ {
-                                data[index] |= 1;
-                            }
-                            j += 1;
-                        }
-                        i += 1;
                     }
-                    in_pin_saved = Some(in_pin);
-                    
-                    
-                    // check we read 40 bits and that the checksum matches
-                    if (j >= 40) && (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
-                        
-                        
-                        // temperature
-                        t = data[2] as f32;
+                    laststate = signal_pin_input.is_high().unwrap();
 
-                        let value = data[3]%128;
-                        match value {
-                            0..=9 => t += (data[3]%128/10) as f32,
-
-                            10..=100 => t += (data[3]%128/100) as f32,
-
-                            _ => t += ((data[3]%128) as i32 /1000) as f32,
-                        }
-
-                        // The left-most digit indicate the negative sign. 
-                        if data[3]>=128 { 
-                            t = -t;
-                        }
-
-                        // Humidity
-                        h = data[0] as f32;
-
-                        //Return temp and humidity values
-
-
-                    
+                    if counter == 255 {
+                        break;
                     }
-                    
+
+                    // ignore first 3 transitions
+                    if (i >= 4) && (i % 2 == 0) {
+                        // shove each bit into the storage bytes
+                        let index = (j / 8) as usize;
+                        data[index] <<= 1;
+                        if counter > count_ {
+                            data[index] |= 1;
+                        }
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                // Saving signal pin to replace value in SIGNAL_PIN
+                signal_pin_saved = Some(signal_pin_input);
+
+                // check we read 40 bits and that the checksum matches
+                if (j >= 40) && (data[4] == (data[0] + data[1] + data[2] + data[3])) {
+                    // converting read temperature to float
+                    t = data[2] as f32;
+
+                    let value = data[3] % 128;
+                    match value {
+                        0..=9 => t += (data[3] % 128 / 10) as f32,
+
+                        10..=100 => t += (data[3] % 128 / 100) as f32,
+
+                        _ => t += ((data[3] % 128) as i32 / 1000) as f32,
+                    }
+
+                    // The left-most digit indicate the negative sign.
+                    if data[3] >= 128 {
+                        t = -t;
+                    }
+
+                    // Humidity
+                    h = data[0] as f32;
                 }
             }
         }
     });
 
-    if replaced{
+    // Put signal pin back to SIGNAL_PIN for next call
+    if replaced {
         free(|cs| {
-            OUT_PIN.borrow(*cs).replace(Some(in_pin_saved.unwrap().into_push_pull_output()));
+            SIGNAL_PIN
+                .borrow(*cs)
+                .replace(Some(signal_pin_saved.unwrap().into_push_pull_output()));
         });
     }
 
-
-    if t < 1000.0 && h < 1000.0{
+    //Return temp and humidity values
+    if t < 1000.0 && h < 1000.0 {
         return Ok((t, h));
     }
 
-    
-    
     // return this when something failed
-    return Err("Could not read values!");   
+    Err("Could not read values!")
 }
 
 //Interrupt handler function
 #[allow(non_snake_case)]
 #[no_mangle]
-fn TIMER1(){
-    let mut do_stuff = false;
+fn TIMER1() {
+    // Only update on specific intervals, didn't find way to setup interrupt timer freq below 1 Hz
+    let mut do_update = false;
     unsafe {
-    if TIMER_COUNTER % UPDATE_INTERVAL == 1{
-        do_stuff = true;
+        if TIMER_COUNTER % UPDATE_INTERVAL == 0 {
+            do_update = true;
+        }
+        TIMER_COUNTER += 1;
     }
-    TIMER_COUNTER = TIMER_COUNTER + 1;
-    }
-    if do_stuff {
-        let data= read_data();
+
+    if do_update {
+        let data = read_data();
         match data {
             Ok(v) => {
                 free(|cs| {
@@ -196,27 +196,18 @@ fn TIMER1(){
                         *data_stored = v;
                     }
                 });
-            },
+            }
+            // Value t = 112 h = 112 used to show error in reading
             Err(_e) => {
                 free(|cs| {
                     if let Some(ref mut data_stored) = DATA.borrow(*cs).borrow_mut().deref_mut() {
-                        *data_stored = (112.0,112.0);
+                        *data_stored = (112.0, 112.0);
                     }
                 });
-            },
+            }
         }
     }
-    
-    //let signal_pin = SIGNAL_PIN.unwrap();
-    //let delay = DELAY.unwrap();
-    
-    //let data= read_data(signal_pin, delay);
-    //match data {
-    //    Ok(v) => DATA = v,
-        //   Err(_e) => DATA = (1111.0, 1111.0),
-    //}
 
-    //TIMER.as_mut().unwrap().clear_update_interrupt_flag();
     free(|cs| {
         if let Some(ref mut timer) = TIMER.borrow(*cs).borrow_mut().deref_mut() {
             timer.clear_update_interrupt_flag();
@@ -228,7 +219,7 @@ fn TIMER1(){
 fn main() -> ! {
     let dp = pac::Peripherals::take().unwrap();
 
-    // Configure clocks
+    // Configure clocks, sysclk set to 80 MHz to work properly with count_ in read_data
     let mut rcu = dp
         .RCU
         .configure()
@@ -240,48 +231,40 @@ fn main() -> ! {
     let gpioa = dp.GPIOA.split(&mut rcu);
     let gpiob = dp.GPIOB.split(&mut rcu);
 
-    let in_pin  = gpioa.pa0.into_pull_up_input();
-    let out_pin = gpioa.pa3.into_push_pull_output();
-
+    let out_pin = gpioa.pa0.into_push_pull_output();
 
     let delay = McycleDelay::new(&rcu.clocks);
-    let delay2 = McycleDelay::new(&rcu.clocks);
 
-    unsafe{
-        //SIGNAL_PIN = Some(signal_pin);
-        //DELAY = Some(delay);
-        free(|cs| {
-            IN_PIN.borrow(*cs).replace(Some(in_pin));
-            OUT_PIN.borrow(*cs).replace(Some(out_pin));
-            DELAY.borrow(*cs).replace(Some(delay));
-        });
-    }
+    free(|cs| {
+        SIGNAL_PIN.borrow(*cs).replace(Some(out_pin));
+        DELAY.borrow(*cs).replace(Some(delay));
+    });
 
     let lcd_pins = lcd_pins!(gpioa, gpiob);
     let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
     let (width, height) = (lcd.size().width as i32, lcd.size().height as i32);
 
     //Set timer
-    unsafe{
-        let mut timer = Timer::timer1(dp.TIMER1, 1.hz(), &mut rcu);
-        timer.listen(Event::Update);
-        //TIMER = Some(timer);
-        free(|cs| {
-            TIMER.borrow(*cs).replace(Some(timer));
-        });
-    }
+    let mut timer = Timer::timer1(dp.TIMER1, 1.hz(), &mut rcu);
+    timer.listen(Event::Update);
+    free(|cs| {
+        TIMER.borrow(*cs).replace(Some(timer));
+    });
 
     //ECLIC setup
     pac::ECLIC::reset();
     pac::ECLIC::set_level_priority_bits(LevelPriorityBits::L0P4);
     pac::ECLIC::set_threshold_level(Level::L1);
-    pac::ECLIC::setup(pac::Interrupt::TIMER1, TriggerType::Level, Level::L1, Priority::P1);
-    unsafe{
-        pac::ECLIC::unmask(pac::Interrupt::TIMER1)
-    };
+    pac::ECLIC::setup(
+        pac::Interrupt::TIMER1,
+        TriggerType::Level,
+        Level::L1,
+        Priority::P1,
+    );
+    unsafe { pac::ECLIC::unmask(pac::Interrupt::TIMER1) };
 
     //Enable interrupts
-    unsafe{riscv::interrupt::enable()};
+    unsafe { riscv::interrupt::enable() };
 
     // Clear screen
     Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32))
@@ -295,55 +278,33 @@ fn main() -> ! {
         .background_color(Rgb565::BLACK)
         .build();
 
-    // (temperature, humidity) pair
-    //let data = read_data(signal_pin, delay);
-
     loop {
-        unsafe{
-            free(|cs| {
-                if let Some(ref mut data) = DATA.borrow(*cs).borrow_mut().deref_mut() {
-                    let mut t_as_text: String<10> = String::from(data.0 as i32);
-                    t_as_text.push('°').unwrap();
-                    t_as_text.push('C').unwrap();
-                    
-                    Text::new(t_as_text.as_str(), Point::new(40, 35), style)
-                        .draw(&mut lcd)
-                        .unwrap();
-                    
-                    let mut h_as_text: String<10> = String::from(data.1 as i32);
-                    h_as_text.push('%').unwrap();
-                    Text::new(h_as_text.as_str(), Point::new(40, 60), style)
+        // Write temperature and humidity values on screen
+        free(|cs| {
+            if let Some(ref mut data) = DATA.borrow(*cs).borrow_mut().deref_mut() {
+                let mut t_as_text: String<10> = String::from(data.0 as i32);
+                t_as_text.push('°').unwrap();
+                t_as_text.push('C').unwrap();
+                t_as_text.push(' ').unwrap(); // Push extra spaces to overwrite last print if string gets shorter (e.g. 12°C -> 9°C )
+                t_as_text.push(' ').unwrap();
+
+                Text::new(t_as_text.as_str(), Point::new(40, 35), style)
                     .draw(&mut lcd)
                     .unwrap();
-            
-                }
-            });
-            
-            // //set text from counter
-            // let mut t_as_text: String<10> = String::from(DATA.0 as i32);
 
-            // t_as_text.push('°').unwrap();
-            // t_as_text.push('C').unwrap();
-
-            // // Draw temperature
-            // Text::new(t_as_text.as_str(), Point::new(40, 35), style)
-            //     .draw(&mut lcd)
-            //     .unwrap();
-            
-            // let mut h_as_text: String<10> = String::from(DATA.1 as i32);
-
-            // h_as_text.push('%').unwrap();
-            
-            // // Draw humidity
-            // Text::new(h_as_text.as_str(), Point::new(40, 60), style)
-            //     .draw(&mut lcd)
-            //     .unwrap();
+                let mut h_as_text: String<10> = String::from(data.1 as i32);
+                h_as_text.push('%').unwrap();
+                h_as_text.push(' ').unwrap(); // Push extra spaces to overwrite last print if string gets shorter (e.g. 15% -> 9%)
+                t_as_text.push(' ').unwrap();
+                Text::new(h_as_text.as_str(), Point::new(40, 60), style)
+                    .draw(&mut lcd)
+                    .unwrap();
             }
-    
+        });
+
         //set chip to sleep
-        unsafe{riscv::asm::wfi();}
+        unsafe {
+            riscv::asm::wfi();
+        }
     }
 }
-
-
-
